@@ -3,6 +3,16 @@
 All follow ``fit(X, y=None) -> self``, ``transform(X)``, ``fit_transform(X)``.
 Scalers and the imputer ignore NaN when learning statistics and keep NaN in
 their output where the input had it (the imputer fills it).
+
+Streaming
+---------
+:class:`StandardScaler`, :class:`Imputer` and :class:`OneHotEncoder` also
+support ``partial_fit(X_chunk, y=None)``, which folds one chunk into the
+learned state without revisiting earlier chunks. ``fit`` always starts from
+scratch; ``partial_fit`` accumulates. Both leave ``transform`` unchanged, so a
+transformer can be used in batch or streaming mode interchangeably. Unlike
+``fit``, ``partial_fit`` accepts an empty chunk (zero rows) and treats it as a
+no-op, because a stream may legitimately deliver one.
 """
 from __future__ import annotations
 
@@ -12,6 +22,7 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 
 from .pipeline import Transformer
+from .stats import RunningStats, StreamingStats
 from .utils import check_2d, check_is_fitted
 
 __all__ = ["StandardScaler", "MinMaxScaler", "Imputer", "OneHotEncoder"]
@@ -55,24 +66,51 @@ class StandardScaler(Transformer):
         All-NaN columns get ``mean_ = 0`` and ``scale_ = 1``.
     n_features_in_ : int
         Number of columns seen in ``fit``.
+    n_samples_seen_ : int
+        Rows folded into the statistics (reset by ``fit``, accumulated by
+        ``partial_fit``).
 
     Notes
     -----
     NaN entries are ignored when fitting and stay NaN when transforming.
+    Both ``fit`` and ``partial_fit`` accumulate through
+    :class:`numcompute.stats.RunningStats`, so a chunked fit and a batch fit
+    give the same statistics to floating-point tolerance.
     Time O(n d), space O(d) beyond the output.
 
     Examples
     --------
     >>> StandardScaler().fit_transform([[1.0], [3.0]]).ravel().tolist()
     [-1.0, 1.0]
+    >>> s = StandardScaler().partial_fit([[1.0], [3.0]]).partial_fit([[5.0]])
+    >>> float(s.mean_[0]), s.n_samples_seen_
+    (3.0, 3)
     """
 
     def __init__(self, with_mean: bool = True, with_std: bool = True):
         self.with_mean = with_mean
         self.with_std = with_std
+        self._running = RunningStats()
+
+    def _finalise(self, n_features: int) -> "StandardScaler":
+        """Derive ``mean_``/``var_``/``scale_`` from the running state.
+
+        Shared by ``fit`` and ``partial_fit`` so both apply exactly the same
+        rules: a column with no observations is centred at 0, and a constant
+        column gets ``scale_ = 1`` (mapping to zeros) instead of dividing by
+        something indistinguishable from zero.
+        """
+        mean, var = self._running.mean, self._running.var()
+        mean = np.where(np.isnan(mean), 0.0, mean)
+        var = np.where(np.isnan(var), 0.0, var)
+        scale = np.sqrt(var)
+        scale = np.where(scale <= 10 * _EPS * np.maximum(1.0, np.abs(mean)), 1.0, scale)
+        self.mean_, self.var_, self.scale_ = mean, var, scale
+        self.n_features_in_ = n_features
+        return self
 
     def fit(self, X, y=None) -> "StandardScaler":
-        """Compute column means and standard deviations.
+        """Compute column means and standard deviations, discarding earlier state.
 
         Parameters
         ----------
@@ -93,17 +131,46 @@ class StandardScaler(Transformer):
             If ``X`` is not 2-D, is empty, or contains infinity.
         """
         X = _check_fit_data(X)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            mean = np.nanmean(X, axis=0)
-            var = np.nanvar(X, axis=0)
-        mean = np.where(np.isnan(mean), 0.0, mean)
-        var = np.where(np.isnan(var), 0.0, var)
-        scale = np.sqrt(var)
-        scale = np.where(scale <= 10 * _EPS * np.maximum(1.0, np.abs(mean)), 1.0, scale)
-        self.mean_, self.var_, self.scale_ = mean, var, scale
-        self.n_features_in_ = X.shape[1]
-        return self
+        self._running = RunningStats().update(X)
+        self.n_samples_seen_ = int(X.shape[0])
+        return self._finalise(X.shape[1])
+
+    def partial_fit(self, X, y=None) -> "StandardScaler":
+        """Fold one chunk into the running mean and variance.
+
+        Parameters
+        ----------
+        X : array_like, shape (n_samples, n_features)
+            Chunk of training data (NaN allowed, zero rows allowed).
+        y : ignored
+
+        Returns
+        -------
+        StandardScaler
+            ``self``, so calls can be chained.
+
+        Raises
+        ------
+        TypeError
+            If ``X`` is not numeric.
+        ValueError
+            If ``X`` is not 2-D, contains infinity, or its feature count
+            differs from earlier chunks.
+
+        Notes
+        -----
+        Uses :class:`numcompute.stats.RunningStats`, i.e. Welford's update
+        generalised to batches by Chan et al.'s parallel merge, so chunks of
+        different sizes are merged without loss of precision and the result
+        does not depend on how the stream was split. Time O(n d) per chunk,
+        space O(d) of retained state.
+        """
+        X = check_2d(X, "X")
+        if np.isinf(X).any():
+            raise ValueError("X contains infinity; clip or remove infinite values first")
+        self._running.update(X)
+        self.n_samples_seen_ = getattr(self, "n_samples_seen_", 0) + int(X.shape[0])
+        return self._finalise(X.shape[1])
 
     def transform(self, X) -> np.ndarray:
         """Standardise ``X`` with the learned statistics.
@@ -287,6 +354,10 @@ class Imputer(Transformer):
     statistics_ : numpy.ndarray, shape (n_features,)
         Replacement value of each column.
     n_features_in_ : int
+    n_samples_seen_ : int
+        Rows folded into the statistics.
+    n_missing_ : numpy.ndarray, shape (n_features,)
+        Missing entries counted per column across everything seen.
 
     Raises
     ------
@@ -295,6 +366,10 @@ class Imputer(Transformer):
 
     Notes
     -----
+    ``fit`` discards any state accumulated by ``partial_fit`` and learns from
+    its argument alone; a later ``partial_fit`` therefore starts a new
+    accumulation. See :meth:`partial_fit` for which strategies are exact in
+    streaming mode.
     Time O(n d) for mean/median (most_frequent adds a sort per column,
     O(n log n d)); space O(n d) for the missing-value mask.
 
@@ -302,6 +377,9 @@ class Imputer(Transformer):
     --------
     >>> Imputer("mean").fit_transform([[1.0], [np.nan], [3.0]]).ravel().tolist()
     [1.0, 2.0, 3.0]
+    >>> imp = Imputer("mean").partial_fit([[1.0], [np.nan]]).partial_fit([[3.0]])
+    >>> float(imp.transform([[np.nan]])[0, 0]), imp.n_missing_.tolist()
+    (2.0, [1.0])
     """
 
     _STRATEGIES = ("mean", "median", "most_frequent", "constant")
@@ -310,6 +388,7 @@ class Imputer(Transformer):
         self.strategy = strategy
         self.fill_value = fill_value
         self.missing_values = missing_values
+        self._stream = None
 
     def _mask(self, X: np.ndarray) -> np.ndarray:
         mv = self.missing_values
@@ -357,6 +436,78 @@ class Imputer(Transformer):
                     stats[j] = vals[np.argmax(counts)]
         self.statistics_ = stats
         self.n_features_in_ = X.shape[1]
+        self.n_samples_seen_ = int(X.shape[0])
+        self.n_missing_ = mask.sum(axis=0).astype(float)
+        self._stream = None
+        return self
+
+    def partial_fit(self, X, y=None) -> "Imputer":
+        """Fold one chunk into the running replacement values.
+
+        Parameters
+        ----------
+        X : array_like, shape (n_samples, n_features)
+            Chunk of training data (zero rows allowed).
+        y : ignored
+
+        Returns
+        -------
+        Imputer
+            ``self``, so calls can be chained.
+
+        Raises
+        ------
+        ValueError
+            If ``X`` is not 2-D, its feature count differs from earlier
+            chunks, or ``strategy='most_frequent'``.
+
+        Notes
+        -----
+        Accuracy depends on the strategy:
+
+        * ``'mean'`` and ``'constant'`` are **exact** — identical to what
+          ``fit`` would produce on the concatenated stream.
+        * ``'median'`` is **approximate**. An exact streaming median would
+          have to retain every value; the estimate comes from the binned
+          quantile of :class:`numcompute.stats.StreamingStats`, so its error
+          is bounded by one histogram bin width.
+        * ``'most_frequent'`` is rejected, because tracking the mode of an
+          unbounded stream needs a count per distinct value. Use ``fit``.
+
+        A column that is missing in every chunk seen so far keeps
+        ``fill_value`` as its replacement, exactly as in ``fit``.
+        :attr:`n_missing_` tracks how many entries were missing per column.
+        Time O(n d) per chunk, space O(d * bins) of retained state.
+        """
+        if self.strategy not in ("mean", "median", "constant"):
+            raise ValueError(
+                f"partial_fit supports strategy 'mean', 'median' and 'constant', got "
+                f"{self.strategy!r}; 'most_frequent' needs the whole dataset, use fit instead"
+            )
+        X = check_2d(X, "X")
+        mask = self._mask(X)
+        fill = float(self.fill_value)
+        if getattr(self, "_stream", None) is None:
+            self._stream = StreamingStats()
+            self.n_samples_seen_ = 0
+            self.n_missing_ = np.zeros(X.shape[1])
+        elif X.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"X has {X.shape[1]} features, but earlier chunks had {self.n_features_in_}"
+            )
+        self._stream.update_stats(np.where(mask, np.nan, X))
+        self.n_samples_seen_ += int(X.shape[0])
+        self.n_missing_ += mask.sum(axis=0)
+        self.n_features_in_ = X.shape[1]
+        if self.strategy == "constant":
+            self.statistics_ = np.full(X.shape[1], fill)
+        elif self.strategy == "mean":
+            self.statistics_ = np.where(np.isnan(self._stream.mean), fill, self._stream.mean)
+        elif self._stream.has_data:
+            med = self._stream.quantile(0.5)
+            self.statistics_ = np.where(np.isnan(med), fill, med)
+        else:  # every value seen so far was missing
+            self.statistics_ = np.full(X.shape[1], fill)
         return self
 
     def transform(self, X) -> np.ndarray:
@@ -397,10 +548,14 @@ class OneHotEncoder(Transformer):
     Attributes
     ----------
     categories_ : list of numpy.ndarray
-        Sorted unique categories of each input column.
+        Categories of each input column, **in output-column order**. After
+        ``fit`` this is sorted; after ``partial_fit`` newly discovered
+        categories are appended (see Notes).
     n_features_in_ : int
     n_output_features_ : int
         Total number of output columns.
+    n_samples_seen_ : int
+        Rows folded into ``categories_``.
 
     Notes
     -----
@@ -409,10 +564,26 @@ class OneHotEncoder(Transformer):
     one block per input column, laid out in input order. Time O(n d log c)
     (binary search per column), space O(n * total_categories).
 
+    **Growing categories.** ``partial_fit`` appends categories it has not seen
+    before to the end of that column's block rather than re-sorting. This is
+    deliberate: the column index of every previously known category is
+    therefore permanent, so a 1 in output column *k* means the same thing in
+    every chunk, before and after the category set grows. The only effect of
+    growth is that later chunks produce *wider* output. Encoded data from an
+    earlier chunk stays valid as a prefix of the current layout, so aligning
+    it only requires padding zero columns on the right — zeros being the
+    correct encoding, since those categories genuinely did not occur. Use
+    :attr:`n_output_features_` to detect that a widening has happened.
+
     Examples
     --------
     >>> OneHotEncoder().fit_transform([["a"], ["b"], ["a"]]).tolist()
     [[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]]
+    >>> enc = OneHotEncoder().partial_fit([["b"], ["a"]]).partial_fit([["c"]])
+    >>> enc.categories_[0].tolist()          # 'c' appended, 'a'/'b' keep their columns
+    ['a', 'b', 'c']
+    >>> enc.transform([["b"]]).tolist()
+    [[0.0, 1.0, 0.0]]
     """
 
     def __init__(self, handle_unknown: str = "error", dtype=float):
@@ -456,8 +627,69 @@ class OneHotEncoder(Transformer):
             raise ValueError("X must not be empty")
         self.categories_ = [np.unique(X[:, j]) for j in range(X.shape[1])]
         self.n_features_in_ = X.shape[1]
+        self.n_samples_seen_ = int(X.shape[0])
+        return self._refresh_layout()
+
+    def _refresh_layout(self) -> "OneHotEncoder":
+        """Recompute the output width and the sorted lookup table.
+
+        ``categories_`` is not guaranteed to be sorted once ``partial_fit``
+        has appended to it, so membership tests use a separately sorted copy
+        and map back to the real output column.
+        """
         self.n_output_features_ = int(sum(len(c) for c in self.categories_))
+        self._lookup = []
+        for cats in self.categories_:
+            order = np.argsort(cats, kind="stable")
+            self._lookup.append((cats[order], order))
         return self
+
+    def partial_fit(self, X, y=None) -> "OneHotEncoder":
+        """Fold one chunk into the known categories, appending new ones.
+
+        Parameters
+        ----------
+        X : array_like, shape (n_samples,) or (n_samples, n_features)
+            Chunk of training data (zero rows allowed).
+        y : ignored
+
+        Returns
+        -------
+        OneHotEncoder
+            ``self``, so calls can be chained.
+
+        Raises
+        ------
+        ValueError
+            If ``X`` has more than 2 dimensions, contains NaN,
+            ``handle_unknown`` is invalid, or the feature count differs from
+            earlier chunks.
+
+        Notes
+        -----
+        Categories unseen so far are appended in sorted order to the end of
+        their column's block, so existing output columns never change
+        meaning; see the class Notes for what that implies for data encoded
+        before the growth. Time O(n d log c) per chunk, space O(total
+        categories).
+        """
+        if self.handle_unknown not in ("error", "ignore"):
+            raise ValueError(f"handle_unknown must be 'error' or 'ignore', got {self.handle_unknown!r}")
+        X = self._as_2d(X)
+        if not hasattr(self, "categories_"):
+            self.categories_ = [np.empty(0, dtype=X.dtype) for _ in range(X.shape[1])]
+            self.n_features_in_ = X.shape[1]
+            self.n_samples_seen_ = 0
+        elif X.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"X has {X.shape[1]} features, but earlier chunks had {self.n_features_in_}"
+            )
+        for j in range(X.shape[1]):
+            fresh = np.setdiff1d(np.unique(X[:, j]), self.categories_[j])
+            if fresh.size:
+                self.categories_[j] = np.concatenate([self.categories_[j], fresh])
+        self.n_samples_seen_ += int(X.shape[0])
+        return self._refresh_layout()
 
     def transform(self, X) -> np.ndarray:
         """Encode ``X``.
@@ -488,16 +720,21 @@ class OneHotEncoder(Transformer):
             )
         n = X.shape[0]
         blocks: List[np.ndarray] = []
-        for j, cats in enumerate(self.categories_):  # loop over columns, not rows
+        for j, (sorted_cats, order) in enumerate(self._lookup):  # loop over columns, not rows
             col = X[:, j]
-            idx = np.minimum(np.searchsorted(cats, col), len(cats) - 1)
-            known = cats[idx] == col
+            n_cat = sorted_cats.size
+            block = np.zeros((n, n_cat), dtype=self.dtype)
+            if n_cat:
+                pos = np.minimum(np.searchsorted(sorted_cats, col), n_cat - 1)
+                known = sorted_cats[pos] == col
+            else:  # a column whose categories are still unknown encodes to nothing
+                known = np.zeros(n, dtype=bool)
             if self.handle_unknown == "error" and not known.all():
                 bad = np.unique(col[~known])[:5].tolist()
                 raise ValueError(f"unknown categories {bad} in column {j}")
-            block = np.zeros((n, len(cats)), dtype=self.dtype)
-            rows = np.nonzero(known)[0]
-            block[rows, idx[rows]] = 1
+            if n_cat:
+                rows = np.nonzero(known)[0]
+                block[rows, order[pos[rows]]] = 1  # order maps sorted position -> output column
             blocks.append(block)
         return np.hstack(blocks)
 

@@ -2,10 +2,20 @@
 
 Labels may be integers, strings or booleans. Rows of a confusion matrix are
 true classes, columns are predicted classes, both in sorted label order.
+
+Streaming
+---------
+:class:`StreamingMetrics`, :class:`RollingMetrics` and :class:`StreamingAUC`
+wrap the same formulas in an ``update`` / ``result`` / ``reset`` interface for
+data that arrives in chunks. :class:`StreamingMetrics` keeps only an
+accumulated confusion matrix, so its memory is O(n_classes^2) no matter how
+long the stream is; the other two must retain observations and say so in
+their docstrings.
 """
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from collections import deque
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -24,6 +34,9 @@ __all__ = [
     "roc_curve",
     "auc",
     "roc_auc_score",
+    "StreamingMetrics",
+    "RollingMetrics",
+    "StreamingAUC",
 ]
 
 _AVERAGES = ("binary", "macro", "micro", "weighted", None)
@@ -562,3 +575,507 @@ def roc_auc_score(y_true, y_score, pos_label=1) -> float:
     """
     fpr, tpr, _ = roc_curve(y_true, y_score, pos_label)
     return auc(fpr, tpr)
+
+
+# --------------------------------------------------------------------------
+# Streaming metrics
+# --------------------------------------------------------------------------
+def _scores_from_counts(tp, fp, fn, support, average, zero_division):
+    """Precision, recall and F1 from per-class counts, using the batch rules."""
+    if np.size(tp) == 0:  # nothing seen yet: averaging over no classes is undefined
+        blank = np.zeros(0) if average is None else float(zero_division)
+        return blank, blank, blank
+    prec = _safe_div(tp, tp + fp, zero_division)
+    rec = _safe_div(tp, tp + fn, zero_division)
+    f1v = _safe_div(2 * tp, 2 * tp + fp + fn, zero_division)
+    return (
+        _average(prec, average, tp, fp, fn, support, "precision", zero_division),
+        _average(rec, average, tp, fp, fn, support, "recall", zero_division),
+        _average(f1v, average, tp, fp, fn, support, "f1", zero_division),
+    )
+
+
+def _check_chunk(y_true_chunk, y_pred_chunk) -> Tuple[np.ndarray, np.ndarray]:
+    """Validate a chunk pair, allowing the empty chunk that ``_check_pair`` rejects."""
+    yt = _as_labels(y_true_chunk, "y_true_chunk")
+    yp = _as_labels(y_pred_chunk, "y_pred_chunk")
+    if yt.shape != yp.shape:
+        raise ValueError(
+            f"y_true_chunk and y_pred_chunk must have the same shape, got {yt.shape} and {yp.shape}"
+        )
+    return yt, yp
+
+
+class StreamingMetrics:
+    """Classification metrics accumulated over a stream of chunks.
+
+    Only a confusion matrix is retained, so memory is O(n_classes^2) however
+    many rows pass through, and every score is derived from it with the same
+    formulas as the batch functions in this module. The result after feeding
+    chunks therefore equals the batch result on the concatenated data.
+
+    Parameters
+    ----------
+    labels : array_like, optional
+        Fixed class order. Default ``None``, which discovers classes as they
+        appear and grows the matrix, keeping labels sorted. With a fixed
+        ``labels`` any sample whose label is not listed is ignored, exactly as
+        in :func:`confusion_matrix`.
+    average : {'binary', 'macro', 'micro', 'weighted', None}, optional
+        Averaging for precision/recall/F1, as in :func:`precision`. Default
+        ``'macro'``, which treats every class equally and is defined for any
+        number of classes. ``'binary'`` requires at most two classes.
+    pos_label : scalar, optional
+        Positive class for ``average='binary'``. Default 1.
+    zero_division : float, optional
+        Value substituted when a denominator is 0, including the accuracy of
+        an empty stream. Default 0.
+
+    Attributes
+    ----------
+    labels_ : numpy.ndarray
+        Classes seen so far, sorted.
+    n_updates_ : int
+        Number of non-empty :meth:`update` calls.
+
+    Raises
+    ------
+    ValueError
+        If ``average`` is unknown.
+
+    Notes
+    -----
+    Time O(n log L) per chunk, space O(L^2).
+
+    Examples
+    --------
+    >>> m = StreamingMetrics().update([0, 1], [0, 0]).update([1, 1], [1, 1])
+    >>> m.accuracy()
+    0.75
+    >>> m.confusion_matrix().tolist()
+    [[1, 0], [1, 2]]
+    """
+
+    def __init__(
+        self,
+        labels=None,
+        average: Optional[str] = "macro",
+        pos_label=1,
+        zero_division: float = 0.0,
+    ) -> None:
+        if average not in _AVERAGES:
+            raise ValueError(f"average must be one of {_AVERAGES}, got {average!r}")
+        self.labels = labels
+        self.average = average
+        self.pos_label = pos_label
+        self.zero_division = float(zero_division)
+        self.reset()
+
+    def reset(self) -> "StreamingMetrics":
+        """Forget every observation seen so far.
+
+        Returns
+        -------
+        StreamingMetrics
+            ``self``, so calls can be chained.
+        """
+        if self.labels is None:
+            self.labels_ = np.empty(0)
+        else:
+            labs = np.asarray(self.labels)
+            if labs.ndim != 1 or labs.size == 0:
+                raise ValueError("labels must be a non-empty 1-D array")
+            if np.unique(labs).size != labs.size:
+                raise ValueError("labels must not contain duplicates")
+            self.labels_ = np.sort(labs)
+        self._cm = np.zeros((self.labels_.size, self.labels_.size), dtype=np.int64)
+        self.n_updates_ = 0
+        return self
+
+    def _grow(self, seen: np.ndarray) -> None:
+        """Expand the matrix when a previously unseen class turns up."""
+        merged = np.union1d(self.labels_, seen) if self.labels_.size else np.unique(seen)
+        if merged.size == self.labels_.size and merged.dtype == self.labels_.dtype:
+            return
+        bigger = np.zeros((merged.size, merged.size), dtype=np.int64)
+        if self.labels_.size:
+            pos = np.searchsorted(merged, self.labels_)
+            bigger[np.ix_(pos, pos)] = self._cm
+        self.labels_, self._cm = merged, bigger
+
+    def update(self, y_true_chunk, y_pred_chunk) -> "StreamingMetrics":
+        """Fold one chunk of predictions into the confusion matrix.
+
+        Parameters
+        ----------
+        y_true_chunk, y_pred_chunk : array_like, shape (n,)
+            True and predicted labels for this chunk. An empty chunk is
+            accepted and changes nothing, because a stream may deliver one.
+
+        Returns
+        -------
+        StreamingMetrics
+            ``self``, so calls can be chained.
+
+        Raises
+        ------
+        TypeError
+            If the labels have object dtype.
+        ValueError
+            If the inputs are not 1-D, differ in shape, or contain NaN.
+
+        Notes
+        -----
+        Classes missing from a chunk need no special handling: the matrix
+        simply gains zeros in their row and column. Time O(n log L), space
+        O(n + L^2).
+        """
+        yt, yp = _check_chunk(y_true_chunk, y_pred_chunk)
+        if yt.size == 0:
+            return self
+        if self.labels is None:
+            self._grow(np.unique(np.concatenate([yt, yp])))
+        self._cm += confusion_matrix(yt, yp, labels=self.labels_)
+        self.n_updates_ += 1
+        return self
+
+    @property
+    def n_samples_(self) -> int:
+        """Samples counted in the matrix (excludes labels outside ``labels``)."""
+        return int(self._cm.sum())
+
+    def confusion_matrix(self) -> np.ndarray:
+        """Accumulated confusion matrix, shape ``(n_classes, n_classes)``."""
+        return self._cm.copy()
+
+    def accuracy(self) -> float:
+        """Fraction of correct predictions over everything accumulated."""
+        total = self._cm.sum()
+        if total == 0:
+            return self.zero_division
+        return float(np.trace(self._cm) / total)
+
+    def _counts(self):
+        cm = self._cm.astype(float)
+        tp = np.diag(cm).copy()
+        fp = cm.sum(axis=0) - tp
+        fn = cm.sum(axis=1) - tp
+        support = cm.sum(axis=1)
+        if self.average == "binary":
+            if self.labels_.size > 2:
+                raise ValueError(
+                    f"average='binary' needs at most 2 classes, found {self.labels_.tolist()}; "
+                    f"use average='macro', 'micro' or 'weighted'"
+                )
+            j = int(np.searchsorted(self.labels_, self.pos_label))
+            if j >= self.labels_.size or self.labels_[j] != self.pos_label:
+                return (np.zeros(1), np.zeros(1), np.zeros(1), np.zeros(1))
+            return tp[j:j + 1], fp[j:j + 1], fn[j:j + 1], support[j:j + 1]
+        return tp, fp, fn, support
+
+    def precision(self):
+        """Precision under the configured ``average``."""
+        return _scores_from_counts(*self._counts(), self.average, self.zero_division)[0]
+
+    def recall(self):
+        """Recall under the configured ``average``."""
+        return _scores_from_counts(*self._counts(), self.average, self.zero_division)[1]
+
+    def f1(self):
+        """F1 score under the configured ``average``."""
+        return _scores_from_counts(*self._counts(), self.average, self.zero_division)[2]
+
+    def result(self) -> Dict[str, Any]:
+        """Every accumulated metric in one dictionary.
+
+        Returns
+        -------
+        dict
+            Keys ``n_samples``, ``n_updates``, ``labels``, ``accuracy``,
+            ``error_rate``, ``precision``, ``recall``, ``f1`` and
+            ``confusion_matrix``.
+
+        Notes
+        -----
+        Time O(L^2), space O(L^2).
+        """
+        prec, rec, f1v = _scores_from_counts(*self._counts(), self.average, self.zero_division)
+        acc = self.accuracy()
+        return {
+            "n_samples": self.n_samples_,
+            "n_updates": self.n_updates_,
+            "labels": self.labels_.copy(),
+            "accuracy": acc,
+            "error_rate": 1.0 - acc if self.n_samples_ else self.zero_division,
+            "precision": prec,
+            "recall": rec,
+            "f1": f1v,
+            "confusion_matrix": self.confusion_matrix(),
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"StreamingMetrics(average={self.average!r}, n_samples_={self.n_samples_}, "
+            f"n_classes={self.labels_.size})"
+        )
+
+
+class RollingMetrics:
+    """Classification metrics over the most recent ``window`` observations.
+
+    Unlike :class:`StreamingMetrics`, which summarises the whole stream, this
+    answers "how is the model doing *now*", which is what reveals that a tree
+    has gone stale between retraining events. It has to retain the window, so
+    memory is O(window); that is inherent to a rolling statistic rather than
+    an implementation shortcut.
+
+    Parameters
+    ----------
+    window : int
+        Number of most recent samples to keep, ``>= 1``.
+    labels, average, pos_label, zero_division
+        As in :class:`StreamingMetrics`.
+
+    Raises
+    ------
+    ValueError
+        If ``window < 1`` or ``average`` is unknown.
+
+    Notes
+    -----
+    Time O(window log L) per :meth:`result`, space O(window).
+
+    Examples
+    --------
+    >>> r = RollingMetrics(window=2).update([1, 1, 0], [0, 0, 0])
+    >>> r.result()["n_samples"], r.accuracy()      # only the last two count
+    (2, 0.5)
+    """
+
+    def __init__(
+        self,
+        window: int,
+        labels=None,
+        average: Optional[str] = "macro",
+        pos_label=1,
+        zero_division: float = 0.0,
+    ) -> None:
+        if isinstance(window, bool) or not isinstance(window, (int, np.integer)) or window < 1:
+            raise ValueError(f"window must be an int >= 1, got {window!r}")
+        if average not in _AVERAGES:
+            raise ValueError(f"average must be one of {_AVERAGES}, got {average!r}")
+        self.window = int(window)
+        self.labels = labels
+        self.average = average
+        self.pos_label = pos_label
+        self.zero_division = float(zero_division)
+        self.reset()
+
+    def reset(self) -> "RollingMetrics":
+        """Empty the window.
+
+        Returns
+        -------
+        RollingMetrics
+            ``self``, so calls can be chained.
+        """
+        self._true: deque = deque(maxlen=self.window)
+        self._pred: deque = deque(maxlen=self.window)
+        return self
+
+    def update(self, y_true_chunk, y_pred_chunk) -> "RollingMetrics":
+        """Append a chunk, dropping whatever falls out of the window.
+
+        Parameters
+        ----------
+        y_true_chunk, y_pred_chunk : array_like, shape (n,)
+            True and predicted labels. An empty chunk changes nothing.
+
+        Returns
+        -------
+        RollingMetrics
+            ``self``, so calls can be chained.
+
+        Raises
+        ------
+        TypeError, ValueError
+            As in :meth:`StreamingMetrics.update`.
+
+        Notes
+        -----
+        A chunk longer than the window keeps only its last ``window`` rows.
+        Time O(n), space O(window).
+        """
+        yt, yp = _check_chunk(y_true_chunk, y_pred_chunk)
+        if yt.size == 0:
+            return self
+        self._true.extend(yt.tolist())
+        self._pred.extend(yp.tolist())
+        return self
+
+    def _snapshot(self) -> StreamingMetrics:
+        snap = StreamingMetrics(
+            labels=self.labels,
+            average=self.average,
+            pos_label=self.pos_label,
+            zero_division=self.zero_division,
+        )
+        return snap.update(np.asarray(self._true), np.asarray(self._pred))
+
+    @property
+    def n_samples_(self) -> int:
+        """Observations currently inside the window."""
+        return len(self._true)
+
+    def accuracy(self) -> float:
+        """Accuracy over the window."""
+        return self._snapshot().accuracy()
+
+    def confusion_matrix(self) -> np.ndarray:
+        """Confusion matrix over the window."""
+        return self._snapshot().confusion_matrix()
+
+    def result(self) -> Dict[str, Any]:
+        """Same keys as :meth:`StreamingMetrics.result`, restricted to the window."""
+        out = self._snapshot().result()
+        out["window"] = self.window
+        return out
+
+    def __repr__(self) -> str:
+        return f"RollingMetrics(window={self.window}, n_samples_={self.n_samples_})"
+
+
+class StreamingAUC:
+    """Area under the ROC curve accumulated over a stream.
+
+    **All scores are retained.** AUC compares every positive against every
+    negative, so unlike accuracy or F1 it cannot be recovered from a fixed
+    number of counters; the exact value needs the scores themselves. This
+    class therefore stores them and computes the exact AUC with
+    :func:`roc_auc_score`, at a memory cost of O(n_seen). Call :meth:`reset`
+    periodically, or use ``max_scores`` to keep only the most recent scores,
+    when that cost matters.
+
+    Parameters
+    ----------
+    pos_label : scalar, optional
+        Label treated as positive. Default 1.
+    max_scores : int, optional
+        Keep only the most recent ``max_scores`` observations. Default
+        ``None`` (keep everything, exact over the whole stream). When set,
+        the result is the exact AUC of the retained suffix, not of the whole
+        stream, and :attr:`n_dropped_` records how many were discarded.
+
+    Attributes
+    ----------
+    n_seen_ : int
+        Observations passed to :meth:`update`.
+    n_dropped_ : int
+        Observations discarded because of ``max_scores``.
+
+    Raises
+    ------
+    ValueError
+        If ``max_scores`` is not a positive integer.
+
+    Notes
+    -----
+    Time O(n log n) per :meth:`result`, space O(min(n_seen, max_scores)).
+
+    Examples
+    --------
+    >>> a = StreamingAUC().update([0, 0], [0.1, 0.4]).update([1, 1], [0.35, 0.8])
+    >>> a.result()
+    0.75
+    """
+
+    def __init__(self, pos_label=1, max_scores: Optional[int] = None) -> None:
+        if max_scores is not None:
+            if isinstance(max_scores, bool) or not isinstance(max_scores, (int, np.integer)) or max_scores < 1:
+                raise ValueError(f"max_scores must be None or an int >= 1, got {max_scores!r}")
+            max_scores = int(max_scores)
+        self.pos_label = pos_label
+        self.max_scores = max_scores
+        self.reset()
+
+    def reset(self) -> "StreamingAUC":
+        """Discard every retained score.
+
+        Returns
+        -------
+        StreamingAUC
+            ``self``, so calls can be chained.
+        """
+        self._true: deque = deque(maxlen=self.max_scores)
+        self._score: deque = deque(maxlen=self.max_scores)
+        self.n_seen_ = 0
+        self.n_dropped_ = 0
+        return self
+
+    def update(self, y_true_chunk, y_score_chunk) -> "StreamingAUC":
+        """Retain one chunk of labels and scores.
+
+        Parameters
+        ----------
+        y_true_chunk : array_like, shape (n,)
+            True labels.
+        y_score_chunk : array_like of float, shape (n,)
+            Scores where higher means more likely positive, e.g. a column of
+            ``predict_proba``. An empty chunk changes nothing.
+
+        Returns
+        -------
+        StreamingAUC
+            ``self``, so calls can be chained.
+
+        Raises
+        ------
+        ValueError
+            If the shapes differ or a score is NaN.
+
+        Notes
+        -----
+        Time O(n), space O(n).
+        """
+        yt = _as_labels(y_true_chunk, "y_true_chunk")
+        ys = as_float_array(y_score_chunk, name="y_score_chunk", ndim=1)
+        if yt.shape != ys.shape:
+            raise ValueError(
+                f"y_true_chunk and y_score_chunk must have the same shape, got {yt.shape} and {ys.shape}"
+            )
+        if ys.size == 0:
+            return self
+        if np.isnan(ys).any():
+            raise ValueError("y_score_chunk contains NaN")
+        before = len(self._true)
+        self._true.extend(yt.tolist())
+        self._score.extend(ys.tolist())
+        self.n_seen_ += int(ys.size)
+        self.n_dropped_ += max(0, before + int(ys.size) - len(self._true))
+        return self
+
+    def result(self) -> float:
+        """Exact AUC over the retained observations.
+
+        Returns
+        -------
+        float
+            ``nan`` while only one class has been seen, because a ROC curve
+            is undefined then. This is deliberate: early chunks of a stream
+            are often single-class, and returning ``nan`` lets a caller plot
+            the metric without special-casing the warm-up.
+
+        Notes
+        -----
+        Time O(n log n), space O(n).
+        """
+        if len(self._true) == 0:
+            return float("nan")
+        yt = np.asarray(self._true)
+        pos = int(np.count_nonzero(yt == self.pos_label))
+        if pos == 0 or pos == yt.size:
+            return float("nan")
+        return roc_auc_score(yt, np.asarray(self._score), pos_label=self.pos_label)
+
+    def __repr__(self) -> str:
+        return f"StreamingAUC(n_seen_={self.n_seen_}, retained={len(self._true)})"

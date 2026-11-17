@@ -29,6 +29,7 @@ __all__ = [
     "maximum",
     "describe",
     "RunningStats",
+    "StreamingStats",
     "histogram",
     "quantile",
 ]
@@ -613,3 +614,392 @@ def quantile(
     if np.isnan(q_arr).any() or (q_arr < 0).any() or (q_arr > 1).any():
         raise ValueError("q must lie in [0, 1]")
     return percentile(a, q_arr * 100.0, axis=axis, interpolation=interpolation, nan_policy=nan_policy)
+
+
+class StreamingStats:
+    """Per-feature statistics maintained incrementally over a stream of chunks.
+
+    Feed chunks with :meth:`update_stats`; the state is O(n_features * bins)
+    regardless of how many rows pass through.
+
+    Accuracy of each statistic
+    --------------------------
+    ``count``, ``mean``, ``var``, ``std``, ``minimum`` and ``maximum`` are
+    **exact**: mean and variance delegate to :class:`RunningStats` (Welford's
+    update generalised to batches by Chan et al.'s parallel merge), so the
+    result equals a batch computation to floating-point tolerance however the
+    data are chunked.
+
+    ``quantile`` and ``histogram`` are **approximate**. An exact streaming
+    quantile would have to retain every value seen; this class instead keeps a
+    fixed grid of ``bins`` equal-width counters per feature. Within the binned
+    range the quantile error is therefore bounded by one bin width,
+    ``(hi - lo) / bins``. Values falling outside the grid are counted in an
+    underflow/overflow counter and, because the exact running minimum and
+    maximum are also kept, quantiles stay inside ``[minimum, maximum]``. Pass
+    ``value_range`` when the data range is known in advance to make the bound
+    tight from the first chunk; otherwise the grid is sized from the first
+    chunk that contains data.
+
+    Parameters
+    ----------
+    bins : int, optional
+        Number of equal-width histogram bins per feature, ``>= 1``. Default 64.
+    value_range : (float, float), optional
+        Fixed ``(low, high)`` grid shared by every feature. Default ``None``,
+        which sizes each feature's grid from the first non-empty chunk.
+    nan_policy : {'omit', 'raise'}, optional
+        ``'omit'`` (default) ignores NaN per feature; ``'raise'`` rejects any
+        chunk containing NaN. ``'propagate'`` is not meaningful for a stream.
+
+    Attributes
+    ----------
+    n_features_ : int or None
+        Set by the first update.
+    n_samples_seen_ : int
+        Rows passed to :meth:`update_stats`, including rows that were all NaN.
+    underflow_, overflow_ : numpy.ndarray, shape (n_features,)
+        Non-NaN values that fell below / above the binned range.
+
+    Raises
+    ------
+    ValueError
+        If ``bins < 1``, ``value_range`` is not ``low <= high``, or
+        ``nan_policy`` is not ``'omit'``/``'raise'``.
+
+    Notes
+    -----
+    Time O(n_rows * n_features) per chunk, space O(n_features * bins).
+
+    Examples
+    --------
+    >>> s = StreamingStats().update_stats([[1.0], [2.0]]).update_stats([[3.0], [4.0]])
+    >>> float(s.mean[0]), float(s.var(ddof=1)[0]), int(s.count[0])
+    (2.5, 1.6666666666666667, 4)
+    """
+
+    def __init__(
+        self,
+        bins: int = 64,
+        value_range: Optional[Tuple[float, float]] = None,
+        nan_policy: str = "omit",
+    ) -> None:
+        if isinstance(bins, bool) or not isinstance(bins, (int, np.integer)) or bins < 1:
+            raise ValueError(f"bins must be an int >= 1, got {bins!r}")
+        check_nan_policy(nan_policy, allowed=("omit", "raise"))
+        if value_range is not None:
+            lo, hi = float(value_range[0]), float(value_range[1])
+            if not np.isfinite(lo) or not np.isfinite(hi) or not lo <= hi:
+                raise ValueError(
+                    f"value_range must be a finite (low, high) pair with low <= high, got {value_range}"
+                )
+            value_range = (lo, hi)
+        self.bins = int(bins)
+        self.value_range = value_range
+        self.nan_policy = nan_policy
+        self.reset()
+
+    # ------------------------------------------------------------------ state
+    def reset(self) -> "StreamingStats":
+        """Forget everything seen so far.
+
+        Returns
+        -------
+        StreamingStats
+            ``self``, so calls can be chained.
+
+        Notes
+        -----
+        Time O(1), space O(1).
+        """
+        self.n_features_: Optional[int] = None
+        self.n_samples_seen_ = 0
+        self._rs = RunningStats()
+        self._counts = np.zeros((0, self.bins))
+        self._edges = np.zeros((0, self.bins + 1))
+        self.underflow_ = np.zeros(0)
+        self.overflow_ = np.zeros(0)
+        self._min = np.zeros(0)
+        self._max = np.zeros(0)
+        self._edge_ready = np.zeros(0, dtype=bool)
+        return self
+
+    def _init(self, n_features: int) -> None:
+        self.n_features_ = n_features
+        self._counts = np.zeros((n_features, self.bins))
+        self._edges = np.zeros((n_features, self.bins + 1))
+        self.underflow_ = np.zeros(n_features)
+        self.overflow_ = np.zeros(n_features)
+        self._min = np.full(n_features, np.nan)
+        self._max = np.full(n_features, np.nan)
+        self._edge_ready = np.zeros(n_features, dtype=bool)
+        if self.value_range is not None:
+            lo, hi = self.value_range
+            self._set_edges(np.ones(n_features, dtype=bool),
+                            np.full(n_features, lo), np.full(n_features, hi))
+
+    def _set_edges(self, which: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> None:
+        """Fix the uniform grid of the selected features; flat ranges are widened.
+
+        A feature's grid is built once, from the first chunk in which that
+        feature has at least one non-NaN value (or from ``value_range``), and
+        never moves afterwards, so counters stay comparable across chunks.
+        """
+        lo = np.asarray(lo, dtype=float).copy()
+        hi = np.asarray(hi, dtype=float).copy()
+        flat = which & ~(hi > lo)  # constant feature: widen by 0.5 on each side
+        lo[flat] -= 0.5
+        hi[flat] += 0.5
+        step = (hi - lo) / self.bins
+        grid = lo[:, None] + step[:, None] * np.arange(self.bins + 1)[None, :]
+        self._edges[which] = grid[which]
+        self._edge_ready |= which
+
+    @property
+    def _has_edges(self) -> bool:
+        return bool(self._edge_ready.any())
+
+    @property
+    def has_data(self) -> bool:
+        """True once at least one non-NaN value has been seen."""
+        return self._has_edges
+
+    # ----------------------------------------------------------------- update
+    def update_stats(self, X_chunk) -> "StreamingStats":
+        """Fold one chunk into the running statistics.
+
+        Parameters
+        ----------
+        X_chunk : array_like, shape (n_rows, n_features) or (n_rows,)
+            New rows. A 1-D chunk is treated as one feature. An empty chunk
+            (zero rows) is accepted and changes nothing.
+
+        Returns
+        -------
+        StreamingStats
+            ``self``, so calls can be chained.
+
+        Raises
+        ------
+        TypeError
+            If ``X_chunk`` is not numeric.
+        ValueError
+            If ``X_chunk`` is not 1-D/2-D, its feature count differs from
+            earlier chunks, it contains an infinity, or it contains NaN while
+            ``nan_policy='raise'``.
+
+        Notes
+        -----
+        Binning is vectorised: because the grid is uniform the bin index is an
+        arithmetic expression, and the counters are accumulated with a single
+        ``numpy.bincount``. Time O(n_rows * n_features), space O(n_rows *
+        n_features) for the chunk.
+        """
+        arr = as_float_array(X_chunk, name="X_chunk", ndim=(1, 2))
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        if self.n_features_ is None:
+            self._init(arr.shape[1])
+        elif arr.shape[1] != self.n_features_:
+            raise ValueError(
+                f"X_chunk has {arr.shape[1]} features, but earlier chunks had {self.n_features_}"
+            )
+        if arr.shape[0] == 0:
+            return self
+        nan_mask = np.isnan(arr)
+        if nan_mask.any() and self.nan_policy == "raise":
+            raise ValueError("X_chunk contains NaN")
+        if np.isinf(arr).any():
+            raise ValueError(
+                "X_chunk contains an infinity; clip or remove infinite values before "
+                "streaming them (they would destroy the running mean and the histogram grid)"
+            )
+
+        self.n_samples_seen_ += int(arr.shape[0])
+        self._rs.update(arr)
+        valid = ~nan_mask
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            chunk_min, chunk_max = np.nanmin(arr, axis=0), np.nanmax(arr, axis=0)
+        self._min = np.fmin(self._min, chunk_min)
+        self._max = np.fmax(self._max, chunk_max)
+        new_grid = ~self._edge_ready & ~np.isnan(self._min)
+        if new_grid.any():
+            self._set_edges(new_grid, self._min, self._max)
+        self._bin(arr, valid & self._edge_ready)
+        return self
+
+    def _bin(self, arr: np.ndarray, valid: np.ndarray) -> None:
+        """Accumulate histogram counters for one chunk (fully vectorised)."""
+        d, b = self.n_features_, self.bins
+        lo, hi = self._edges[:, 0], self._edges[:, -1]
+        width = np.where(hi > lo, (hi - lo) / b, 1.0)
+        safe = np.where(valid, arr, lo)  # NaN placeholder, masked out below
+        idx = np.floor((safe - lo) / width).astype(np.intp)
+        idx = np.where(safe == hi, b - 1, idx)  # last bin includes its right edge
+        under = (idx < 0) & valid
+        over = (idx >= b) & valid
+        inside = valid & ~under & ~over
+        self.underflow_ += under.sum(axis=0)
+        self.overflow_ += over.sum(axis=0)
+        if inside.any():
+            cols = np.broadcast_to(np.arange(d), arr.shape)
+            flat = cols[inside] * b + idx[inside]
+            self._counts += np.bincount(flat, minlength=d * b).reshape(d, b)
+
+    # ------------------------------------------------------------- statistics
+    @property
+    def count(self) -> np.ndarray:
+        """Non-NaN observations per feature, shape ``(n_features,)``."""
+        return self._rs.count
+
+    @property
+    def mean(self) -> np.ndarray:
+        """Exact running mean per feature (NaN where nothing was observed)."""
+        return self._rs.mean
+
+    def var(self, ddof: int = 0) -> np.ndarray:
+        """Exact running variance per feature; see :meth:`RunningStats.var`."""
+        return self._rs.var(ddof)
+
+    def std(self, ddof: int = 0) -> np.ndarray:
+        """Exact running standard deviation per feature."""
+        return self._rs.std(ddof)
+
+    def minimum(self) -> np.ndarray:
+        """Exact running minimum per feature (NaN where nothing was observed)."""
+        return self._min.copy() if self.n_features_ is not None else np.zeros(0)
+
+    def maximum(self) -> np.ndarray:
+        """Exact running maximum per feature (NaN where nothing was observed)."""
+        return self._max.copy() if self.n_features_ is not None else np.zeros(0)
+
+    def histogram(self, feature: int = 0) -> Tuple[np.ndarray, np.ndarray]:
+        """Counts and edges of one feature's binned range.
+
+        Parameters
+        ----------
+        feature : int, optional
+            Feature index (negative indices allowed). Default 0.
+
+        Returns
+        -------
+        counts : numpy.ndarray, shape (bins,)
+            Values that fell inside the grid. Values outside it are in
+            :attr:`underflow_` / :attr:`overflow_` instead.
+        edges : numpy.ndarray, shape (bins + 1,)
+            Uniform bin edges; the last bin includes its right edge.
+
+        Raises
+        ------
+        ValueError
+            If no chunk has been seen yet or ``feature`` is out of range.
+
+        Notes
+        -----
+        Time O(bins), space O(bins).
+        """
+        self._require_data("histogram")
+        j = normalize_axis(feature, self.n_features_)
+        return self._counts[j].copy(), self._edges[j].copy()
+
+    def quantile(self, q) -> np.ndarray:
+        """Approximate streaming quantiles per feature.
+
+        Parameters
+        ----------
+        q : float or array_like of float
+            Quantile levels in ``[0, 1]``.
+
+        Returns
+        -------
+        numpy.ndarray
+            Shape ``(n_features,)`` for scalar ``q``, else
+            ``(len(q), n_features)``. Features with no observations give NaN.
+
+        Raises
+        ------
+        ValueError
+            If no chunk has been seen yet or ``q`` is outside ``[0, 1]``.
+
+        Notes
+        -----
+        Linear interpolation inside the cumulative histogram, with the
+        underflow and overflow counters treated as two extra bins reaching the
+        exact running minimum and maximum. The result is therefore always
+        within ``[minimum(), maximum()]`` and, for mass inside the grid,
+        within one bin width of the exact quantile. Time O(n_features * bins),
+        space O(n_features * bins).
+        """
+        self._require_data("quantile")
+        q_arr = as_float_array(q, name="q")
+        if np.isnan(q_arr).any() or (q_arr < 0).any() or (q_arr > 1).any():
+            raise ValueError("q must lie in [0, 1]")
+        levels = np.atleast_1d(q_arr).ravel()
+        out = np.full((levels.size, self.n_features_), np.nan)
+        for j in range(self.n_features_):  # loop over features; inner work is vectorised
+            counts = np.concatenate(([self.underflow_[j]], self._counts[j], [self.overflow_[j]]))
+            total = counts.sum()
+            if total <= 0:
+                continue
+            lo = np.fmin(self._min[j], self._edges[j, 0])
+            hi = np.fmax(self._max[j], self._edges[j, -1])
+            edges = np.concatenate(([lo], self._edges[j], [hi]))
+            cum = np.cumsum(counts)
+            targets = levels * total
+            k = np.searchsorted(cum, targets, side="left")
+            k = np.clip(k, 0, counts.size - 1)
+            prev = np.where(k > 0, cum[np.maximum(k - 1, 0)], 0.0)
+            width = counts[k]
+            frac = np.where(width > 0, (targets - prev) / np.where(width > 0, width, 1.0), 0.0)
+            vals = edges[k] + np.clip(frac, 0.0, 1.0) * (edges[k + 1] - edges[k])
+            out[:, j] = np.clip(vals, self._min[j], self._max[j])
+        return out[0] if q_arr.ndim == 0 else out
+
+    def _require_data(self, what: str) -> None:
+        if self.n_features_ is None or not self._has_edges:
+            raise ValueError(
+                f"cannot compute {what}: no data has been seen yet; call update_stats first"
+            )
+
+    def result(self) -> Dict[str, object]:
+        """Every statistic in one dictionary.
+
+        Returns
+        -------
+        dict
+            Keys ``n_samples_seen``, ``count``, ``mean``, ``var``, ``std``,
+            ``min``, ``max``, ``q25``, ``median``, ``q75``. The quantile
+            entries are approximate (see the class docstring); everything else
+            is exact.
+
+        Raises
+        ------
+        ValueError
+            If no chunk has been seen yet.
+
+        Notes
+        -----
+        Time O(n_features * bins), space O(n_features).
+        """
+        self._require_data("result")
+        q25, med, q75 = self.quantile([0.25, 0.5, 0.75])
+        return {
+            "n_samples_seen": self.n_samples_seen_,
+            "count": self.count,
+            "mean": self.mean,
+            "var": self.var(),
+            "std": self.std(),
+            "min": self.minimum(),
+            "max": self.maximum(),
+            "q25": q25,
+            "median": med,
+            "q75": q75,
+        }
+
+    def __repr__(self) -> str:
+        d = "unset" if self.n_features_ is None else self.n_features_
+        return (
+            f"StreamingStats(bins={self.bins}, n_features_={d}, "
+            f"n_samples_seen_={self.n_samples_seen_})"
+        )
