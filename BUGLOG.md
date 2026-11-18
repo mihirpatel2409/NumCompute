@@ -4,8 +4,10 @@ This log records the defects found while building and testing NumCompute, how ea
 how it was fixed, and which test now protects against it. It also records the process problems
 we ran into while working as a team, because they affected the code on `main`.
 
-**Final state:** 281 unit tests, all passing (`python -m pytest tests -q`), all doctests passing,
-`pyflakes` and `pycodestyle` clean.
+**Original core suite:** 281 unit tests. The Assignment 2.2 branch adds 73 streaming-specific tests,
+for 354 tests collected in total. Test collection is not the same as a passing test run; verify the
+current branch with `python -m pytest -q`. The original core-suite doctests, `pyflakes`, and
+`pycodestyle` checks are recorded below as part of the earlier project validation.
 
 ## 1. How bugs were found
 
