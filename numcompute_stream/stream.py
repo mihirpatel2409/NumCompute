@@ -317,8 +317,8 @@ class StreamTrainer:
         Parameters
         ----------
         chunks : iterable of (array_like, array_like)
-            For example the output of
-            chunked CSV data prepared with :func:`numcompute.io.iter_csv_chunks`.
+            For example, feature and target arrays paired after reading a CSV
+            file in chunks.
 
         Returns
         -------
