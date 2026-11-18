@@ -2,77 +2,77 @@
 
 ## Environment
 
-- python: 3.14.0
-- numpy: 2.4.0
-- platform: Windows-11-10.0.26300-SP0
+- python: 3.15.0
+- numpy: 2.5.4
+- platform: Windows-11-10.0.26200-SP0
 - machine: AMD64
-- processor: Intel64 Family 6 Model 186 Stepping 2, GenuineIntel
-- cpu_count: 20
-- date: 2026-10-20 12:44 UTC
+- processor: AMD64 Family 23 Model 96 Stepping 1, AuthenticAMD
+- cpu_count: 16
+- date: 2026-11-18 01:58 UTC
 - seed: 0
 - repeats: 3 (best time reported)
-- mode: full
+- mode: quick
 
 ## Standardise columns (10 features)
 
 | Size | Loop | Vectorised | Speed-up | Match |
 |---:|---:|---:|---:|:---:|
-| 1,000 | 4.70 ms | 161.8 us | 29.0x | yes |
-| 5,000 | 22.47 ms | 750.5 us | 29.9x | yes |
-| 20,000 | 92.30 ms | 2.80 ms | 33.0x | yes |
+| 200 | 2.21 ms | 127.1 us | 17.4x | yes |
+| 1,000 | 7.56 ms | 154.0 us | 49.1x | yes |
+| 5,000 | 39.38 ms | 1.22 ms | 32.2x | yes |
 
 ## Row softmax (20 classes)
 
 | Size | Loop | Vectorised | Speed-up | Match |
 |---:|---:|---:|---:|:---:|
-| 1,000 | 2.30 ms | 166.5 us | 13.8x | yes |
-| 5,000 | 16.09 ms | 1.44 ms | 11.2x | yes |
-| 20,000 | 74.41 ms | 5.24 ms | 14.2x | yes |
+| 100 | 377.7 us | 46.1 us | 8.2x | yes |
+| 500 | 1.91 ms | 148.7 us | 12.8x | yes |
+| 2,000 | 8.80 ms | 513.2 us | 17.2x | yes |
 
 ## Pairwise Euclidean distances (8 features)
 
 | Size | Loop | Vectorised | Speed-up | Match |
 |---:|---:|---:|---:|:---:|
-| 100 | 12.08 ms | 43.5 us | 277.8x | yes |
-| 200 | 48.51 ms | 344.8 us | 140.7x | yes |
-| 400 | 209.58 ms | 1.77 ms | 118.2x | yes |
+| 20 | 646.4 us | 16.9 us | 38.2x | yes |
+| 50 | 4.10 ms | 26.4 us | 155.2x | yes |
+| 100 | 16.20 ms | 48.5 us | 334.0x | yes |
 
 ## Average ranks with ties
 
 | Size | Loop | Vectorised | Speed-up | Match |
 |---:|---:|---:|---:|:---:|
-| 500 | 10.36 ms | 60.7 us | 170.7x | yes |
-| 1,000 | 40.07 ms | 87.3 us | 459.0x | yes |
-| 2,000 | 164.44 ms | 176.1 us | 933.8x | yes |
+| 100 | 445.1 us | 60.4 us | 7.4x | yes |
+| 300 | 3.65 ms | 78.9 us | 46.2x | yes |
+| 600 | 14.18 ms | 83.2 us | 170.4x | yes |
 
 ## Top-10 of n values
 
 | Size | Loop | Vectorised | Speed-up | Match |
 |---:|---:|---:|---:|:---:|
-| 10,000 | 2.36 ms | 133.4 us | 17.7x | yes |
-| 100,000 | 42.38 ms | 1.27 ms | 33.3x | yes |
-| 300,000 | 194.32 ms | 3.46 ms | 56.2x | yes |
+| 1,000 | 233.2 us | 80.8 us | 2.9x | yes |
+| 10,000 | 3.58 ms | 176.8 us | 20.3x | yes |
+| 50,000 | 72.21 ms | 1.24 ms | 58.3x | yes |
 
 ## Histogram (20 bins)
 
 | Size | Loop | Vectorised | Speed-up | Match |
 |---:|---:|---:|---:|:---:|
-| 10,000 | 999.5 us | 172.1 us | 5.8x | yes |
-| 100,000 | 11.31 ms | 1.94 ms | 5.8x | yes |
-| 500,000 | 63.22 ms | 10.33 ms | 6.1x | yes |
+| 1,000 | 175.0 us | 43.7 us | 4.0x | yes |
+| 10,000 | 1.77 ms | 301.5 us | 5.9x | yes |
+| 50,000 | 13.73 ms | 2.18 ms | 6.3x | yes |
 
 ## Streaming mean/variance (Welford loop vs batch)
 
 | Size | Loop | Vectorised | Speed-up | Match |
 |---:|---:|---:|---:|:---:|
-| 10,000 | 779.4 us | 103.4 us | 7.5x | yes |
-| 100,000 | 7.24 ms | 836.2 us | 8.7x | yes |
-| 500,000 | 37.98 ms | 4.08 ms | 9.3x | yes |
+| 1,000 | 178.9 us | 43.8 us | 4.1x | yes |
+| 10,000 | 882.1 us | 71.6 us | 12.3x | yes |
+| 50,000 | 5.04 ms | 885.4 us | 5.7x | yes |
 
 ## Finite-difference gradient (one call per point vs one batched call)
 
 | Size | Loop | Vectorised | Speed-up | Match |
 |---:|---:|---:|---:|:---:|
-| 100 | 550.2 us | 32.3 us | 17.0x | yes |
-| 500 | 4.07 ms | 2.23 ms | 1.8x | yes |
-| 1,500 | 25.76 ms | 24.43 ms | 1.1x | yes |
+| 20 | 180.1 us | 38.1 us | 4.7x | yes |
+| 100 | 793.6 us | 58.0 us | 13.7x | yes |
+| 300 | 3.19 ms | 1.62 ms | 2.0x | yes |
