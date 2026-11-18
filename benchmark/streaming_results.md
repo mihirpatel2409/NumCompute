@@ -1,18 +1,36 @@
 # Streaming Decision Tree Benchmark
 
-The previous results were generated with a fixed 64-row incoming chunk. That
-made the 16-, 32-, and 64-sample buffer comparisons difficult to interpret,
-because an incoming chunk could equal or exceed the buffer threshold.
+## Experimental setup
 
-The benchmark methodology has been corrected to use the same 16-row incoming
-chunks for every buffer size and the median training time across three runs.
-All tested buffer sizes are multiples of 16.
+- Training samples: 2,400
+- Test samples: 600
+- Fixed incoming chunk size: 16 rows
+- Buffer sizes: 16, 32, 64, 128, and 256
+- Repeated runs per buffer size: 3
+- Training time: median across the three runs
+- Dataset: reproducibly generated with random seed 42
 
-Regenerate the results from the repository root:
+## Measured results
+
+| Buffer Size | Chunk Size | Accuracy | Median Training Time (seconds) | Retrain Count | Runs |
+|---:|---:|---:|---:|---:|---:|
+| 16 | 16 | 0.7067 | 0.121408 | 150 | 3 |
+| 32 | 16 | 0.7183 | 0.102590 | 75 | 3 |
+| 64 | 16 | 0.7150 | 0.086192 | 37 | 3 |
+| 128 | 16 | 0.7450 | 0.067467 | 18 | 3 |
+| 256 | 16 | 0.7617 | 0.055604 | 9 | 3 |
+
+## Interpretation
+
+In this experiment, the 256-row buffer achieved the highest observed accuracy
+(0.7617), the shortest median training time (0.055604 seconds), and the fewest
+retraining events (9). Increasing the buffer size reduced the frequency of
+retraining and the measured training time in this run. These results describe
+this generated dataset and execution environment; they are not universal
+performance guarantees.
+
+Regenerate the experiment from the repository root with:
 
 ```powershell
 python benchmark/streaming_benchmark.py
 ```
-
-The script writes the new measured results to this file. Do not quote the
-previous accuracy or timing figures; they belong to the superseded experiment.
