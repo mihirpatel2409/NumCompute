@@ -1,0 +1,55 @@
+name: Assignment 2.2 validation
+
+on:
+  push:
+    branches:
+      - mihir-assignment-2.2
+  pull_request:
+    branches:
+      - mihir-assignment-2.2
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out assignment branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install project and validation dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]" matplotlib nbconvert ipykernel
+
+      - name: Run complete test suite with coverage
+        run: |
+          python -m pytest -q --cov=numcompute --cov=numcompute_stream --cov-report=term-missing --cov-report=xml
+
+      - name: Execute demonstration notebook from top to bottom
+        run: |
+          mkdir -p validation-output
+          jupyter nbconvert --to notebook --execute demo/stream_demo.ipynb --output stream_demo.executed.ipynb --output-dir validation-output --ExecutePreprocessor.timeout=300
+
+      - name: Run corrected streaming benchmark
+        run: python benchmark/streaming_benchmark.py
+
+      - name: Upload validation outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: assignment-2.2-validation-${{ github.run_number }}
+          path: |
+            coverage.xml
+            validation-output/stream_demo.executed.ipynb
+            benchmark/streaming_results.md
+          if-no-files-found: warn
