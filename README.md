@@ -173,17 +173,23 @@ The notebook also extracts cumulative accuracy from `trainer.history` and visual
 
 ## 6. Benchmark results
 
-The repository's recorded buffer-size experiment is documented in [`benchmark/streaming_results.md`](benchmark/streaming_results.md).
+The benchmark compares buffer sizes of 16, 32, 64, 128, and 256 samples using
+the same 16-row incoming chunks. Each buffer size is a multiple of the chunk
+size, preventing oversized chunks from triggering early rebuilds. Each
+configuration is repeated three times, and the median training time is
+reported to reduce single-run timing noise.
 
-| Buffer size | Accuracy | Training time (seconds) | Retrain count |
-|---:|---:|---:|---:|
-| 16 | 0.7183 | 0.154687 | 38 |
-| 32 | 0.7183 | 0.151658 | 38 |
-| 64 | 0.7150 | 0.152099 | 37 |
-| 128 | 0.7450 | 0.112824 | 18 |
-| 256 | 0.7617 | 0.088693 | 9 |
+Regenerate the measured results from the repository root:
 
-In this recorded experiment, a buffer size of 256 produced the highest listed accuracy (0.7617), the lowest listed training time (0.088693 seconds), and 9 retraining events. The results illustrate the trade-off between buffer size, retraining frequency, and observed performance for this particular run. They are not universal performance guarantees; results depend on the dataset, environment, and experimental configuration.
+```powershell
+python benchmark/streaming_benchmark.py
+```
+
+The script writes the measured table to
+[`benchmark/streaming_results.md`](benchmark/streaming_results.md). Results
+should be regenerated on the current checkout before making claims about which
+buffer size performs best; timing and accuracy depend on the dataset and
+execution environment.
 
 ## 7. Run the tests
 
